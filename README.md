@@ -341,9 +341,42 @@ Long operations report phases to stderr:
 
 Hide phase and progress messages with --quiet-progress.
 
-The script does not emit color or ANSI escape sequences. Interactive progress
-uses a carriage return only when stderr is a terminal. Redirected output and
-Synology logs receive ordinary lines without terminal control sequences.
+### ANSI Color Safety
+
+The default --color auto mode emits ANSI colors only when the destination
+stream is an interactive terminal. stdout and stderr are evaluated separately.
+This means terminal output can be colored while redirected files, pipelines,
+Synology Task Scheduler logs, and other non-TTY destinations remain free of
+ANSI escape sequences.
+
+Color modes:
+
+- --color auto: color only on a TTY; this is the default.
+- --color always: force ANSI color even through a pipe or redirection.
+- --color never: disable ANSI color everywhere.
+
+Auto mode also disables color when NO_COLOR is present or TERM is set to dumb.
+JSON output disables color unconditionally, including progress on stderr, even
+when --color always is supplied.
+
+~~~bash
+# Interactive terminals use color automatically.
+python3 plex_nfkd_title_sort_api.py --dry-run
+
+# No ANSI control sequences are written to this log.
+python3 plex_nfkd_title_sort_api.py --dry-run > result.log 2>&1
+
+# Explicitly disable color.
+python3 plex_nfkd_title_sort_api.py --dry-run --color never
+
+# Use the standard environment convention to disable automatic color.
+NO_COLOR=1 python3 plex_nfkd_title_sort_api.py --dry-run
+~~~
+
+Interactive progress uses a carriage return only when stderr is a terminal.
+When stderr is redirected, every progress update is written as an ordinary
+line without carriage-return control behavior. Avoid --color always when the
+destination is a file unless ANSI sequences are intentionally required.
 
 Every successful run prints a clear result and exit code:
 
@@ -541,6 +574,10 @@ PLAYLIST_ONLY_FILTER=OK
 PLEX_AWARE_SORT_KEYS=OK
 CONSOLE_SUMMARY_AND_DETAILS=OK
 JSON_OUTPUT=OK
+ANSI_COLOR_MODES=OK
+NO_COLOR_AND_TERM_DUMB=OK
+JSON_ANSI_DISABLED=OK
+REDIRECTED_OUTPUT_NO_CONTROL_SEQUENCES=OK
 PHASE_AND_PROGRESS_OUTPUT=OK
 COMPACT_ZERO_CHANGE_OUTPUT=OK
 DRY_RUN_ZERO_PUT=OK

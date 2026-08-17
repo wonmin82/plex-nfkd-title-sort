@@ -32,7 +32,7 @@ from pathlib import Path
 
 
 PROGRAM = "plex_nfkd_title_sort_api"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DEFAULT_PLEX_URL = "http://127.0.0.1:32400"
 DEFAULT_ARTICLE_STRINGS = ("the", "das", "der", "a", "an", "el", "la")
 MAIN_DB_NAME = "com.plexapp.plugins.library.db"
@@ -493,43 +493,97 @@ def pad_display(value, width):
     return value + " " * max(0, width - display_width(value))
 
 
+ANSI_RESET = "\033[0m"
+STYLE_BOLD = "1"
+STYLE_DIM = "2"
+STYLE_RED = "31"
+STYLE_YELLOW = "33"
+STYLE_CYAN = "36"
+STYLE_BOLD_RED = "1;31"
+STYLE_BOLD_GREEN = "1;32"
+STYLE_BOLD_YELLOW = "1;33"
+STYLE_BOLD_CYAN = "1;36"
+
+
+def color_enabled(mode, stream, output_format="text", environ=None):
+    if output_format == "json":
+        return False
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    environment = os.environ if environ is None else environ
+    try:
+        is_terminal = bool(stream.isatty())
+    except Exception:
+        is_terminal = False
+    return (
+        is_terminal
+        and environment.get("TERM", "").lower() != "dumb"
+        and "NO_COLOR" not in environment
+    )
+
+
+def style_text(text, style, enabled):
+    if not enabled or not style:
+        return str(text)
+    return "\033[{0}m{1}{2}".format(style, text, ANSI_RESET)
+
+
+def result_style(result):
+    if result in ("NO CHANGES REQUIRED", "APPLY SUCCEEDED", "RESTORE SUCCEEDED"):
+        return STYLE_BOLD_GREEN
+    if result in ("CHANGES PLANNED", "APPLY PARTIALLY FAILED"):
+        return STYLE_BOLD_YELLOW
+    if result in ("APPLY FAILED", "ERROR"):
+        return STYLE_BOLD_RED
+    return STYLE_BOLD_CYAN
+
+
+def result_line(result, enabled):
+    return style_text("RESULT: {0}".format(result), result_style(result), enabled)
+
+
 class ProgressReporter:
-    def __init__(self, enabled=True):
+    def __init__(self, enabled=True, color=False):
         self.enabled = enabled
+        self.color = color
         self.started_at = time.monotonic()
         self.last_tty_length = 0
 
     def _elapsed(self):
         return time.monotonic() - self.started_at
 
-    def line(self, message, transient=False):
+    def line(self, message, transient=False, style=None):
         if not self.enabled:
             return
-        text = "{0}  ({1:.1f}s)".format(message, self._elapsed())
+        plain_text = "{0}  ({1:.1f}s)".format(message, self._elapsed())
         if transient and sys.stderr.isatty():
             width = terminal_width()
-            text = truncate_display(text, width - 1)
-            padding = " " * max(0, self.last_tty_length - display_width(text))
-            print("\r{0}{1}".format(text, padding), end="", file=sys.stderr, flush=True)
-            self.last_tty_length = display_width(text)
+            plain_text = truncate_display(plain_text, width - 1)
+            padding = " " * max(0, self.last_tty_length - display_width(plain_text))
+            rendered = style_text(plain_text, style, self.color)
+            print("\r{0}{1}".format(rendered, padding), end="", file=sys.stderr, flush=True)
+            self.last_tty_length = display_width(plain_text)
         else:
             self.finish_transient()
-            print(text, file=sys.stderr, flush=True)
+            print(style_text(plain_text, style, self.color), file=sys.stderr, flush=True)
 
     def phase(self, current, total, message):
-        self.line("[{0}/{1}] {2}".format(current, total, message))
+        self.line("[{0}/{1}] {2}".format(current, total, message), style=STYLE_BOLD_CYAN)
 
     def update(self, current, total, message):
         self.line(
             "{0}: {1:,}/{2:,}".format(message, current, total),
             transient=True,
+            style=STYLE_CYAN,
         )
 
     def count(self, current, message):
-        self.line("{0}: {1:,}".format(message, current), transient=True)
+        self.line("{0}: {1:,}".format(message, current), transient=True, style=STYLE_CYAN)
 
     def detail(self, message):
-        self.line("      {0}".format(message))
+        self.line("      {0}".format(message), style=STYLE_DIM)
 
     def finish_transient(self):
         if self.enabled and self.last_tty_length and sys.stderr.isatty():
@@ -542,7 +596,9 @@ def emit_json(payload):
 
 
 def emit_error(args, exit_code, message):
-    print("ERROR: {0}".format(message), file=sys.stderr)
+    stderr_color = getattr(args, "stderr_color", False)
+    stdout_color = getattr(args, "stdout_color", False)
+    print(style_text("ERROR: {0}".format(message), STYLE_BOLD_RED, stderr_color), file=sys.stderr)
     if getattr(args, "output_format", "text") == "json":
         emit_json(
             {
@@ -554,7 +610,7 @@ def emit_error(args, exit_code, message):
             }
         )
     else:
-        print("\nRESULT: ERROR")
+        print("\n{0}".format(result_line("ERROR", stdout_color)))
         print("Exit code: {0}".format(exit_code))
     return exit_code
 
@@ -646,6 +702,15 @@ def parse_args(argv=None):
         choices=("text", "json"),
         default="text",
         help="terminal output format (default: text); progress remains on stderr",
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help=(
+            "ANSI color mode (default: auto); auto uses color only on a TTY and "
+            "honors NO_COLOR and TERM=dumb; JSON always disables color"
+        ),
     )
 
     parser.add_argument(
@@ -2028,17 +2093,21 @@ def build_scan_report(
     }
 
 
-def print_count_table(title, groups):
+def print_section(title, color):
+    print("\n{0}".format(style_text(title, STYLE_BOLD_CYAN, color)))
+
+
+def print_count_table(title, groups, color=False):
     groups = {name: values for name, values in groups.items() if values["candidates"]}
     if not groups:
         return
     available = terminal_width()
     name_width = max(16, min(36, available - 51))
-    print("\n{0}".format(title))
+    print_section(title, color)
     print(
-        "  {0}  {1:>9}  {2:>10}  {3:>11}  {4:>9}".format(
+        style_text("  {0}  {1:>9}  {2:>10}  {3:>11}  {4:>9}".format(
             pad_display("Name", name_width), "Scanned", "Candidates", "Value edits", "Lock adds"
-        )
+        ), STYLE_BOLD, color)
     )
     print("  {0}  {1}  {2}  {3}  {4}".format(
         "-" * name_width, "-" * 9, "-" * 10, "-" * 11, "-" * 9
@@ -2068,7 +2137,10 @@ def print_summary(
     article_source,
 ):
     mode = "APPLY" if args.apply else "DRY-RUN"
-    print("\nPlex NFKD Sort Title {0} [{1}]".format(VERSION, mode))
+    color = getattr(args, "stdout_color", False)
+    print("\n{0}".format(style_text(
+        "Plex NFKD Sort Title {0} [{1}]".format(VERSION, mode), STYLE_BOLD_CYAN, color
+    )))
     print("Server : Plex {0} at {1}".format(identity.get("version") or "(unknown)", args.plex_url))
     print("Scope  : {0}".format(scope_label(args)))
     print("Source : Plex API only")
@@ -2077,7 +2149,7 @@ def print_summary(
         print("Token  : {0}".format(token_source))
         print("Articles: {0}".format(", ".join(article_strings) if article_strings else "(none)"))
         print("Article source: {0}".format(article_source))
-    print("\nScan summary")
+    print_section("Scan summary", color)
     print("  Metadata rows                     {0:>10,}".format(stats["total_api_rows"]))
     print("  Title missing                     {0:>10,}".format(stats["title_null"]))
     print("  Title empty                       {0:>10,}".format(stats["title_empty"]))
@@ -2088,15 +2160,15 @@ def print_summary(
     if stats["already_correct_other"]:
         print("    Other equivalent state          {0:>10,}".format(stats["already_correct_other"]))
 
-    print("\nPlanned changes")
+    print_section("Planned changes", color)
     if not stats["candidates"]:
         print("  None")
         if stats["duplicates"]:
             print("\nDuplicate API rows ignored: {0:,}".format(stats["duplicates"]))
         if warnings:
-            print("\nWarnings")
+            print_section("Warnings", color)
             for warning in warnings:
-                print("  - {0}".format(warning))
+                print(style_text("  - {0}".format(warning), STYLE_YELLOW, color))
         return
     print("  Total candidates                  {0:>10,}".format(stats["candidates"]))
     action_labels = (
@@ -2110,7 +2182,7 @@ def print_summary(
     print("  titleSort value edits             {0:>10,}".format(stats["value_changes"]))
     print("  titleSort lock additions          {0:>10,}".format(stats["lock_adds"]))
 
-    print("\nCurrent titleSort status among candidates")
+    print_section("Current titleSort status among candidates", color)
     status_labels = (
         ("TITLE_SORT_NULL", "Missing titleSort"),
         ("TITLE_SORT_OMITTED_EQUIVALENT", "Plex title fallback (equivalent)"),
@@ -2121,7 +2193,7 @@ def print_summary(
     for status, label in status_labels:
         if stats["status:{0}".format(status)]:
             print("  {0:<34} {1:>10,}".format(label, stats["status:{0}".format(status)]))
-    print("\nSort-key source among candidates")
+    print_section("Sort-key source among candidates", color)
     if stats["source:EXISTING_TITLE_SORT"]:
         print("  Existing Plex/custom titleSort    {0:>10,}".format(stats["source:EXISTING_TITLE_SORT"]))
     if stats["source:DERIVED_PLEX_RULES"]:
@@ -2129,15 +2201,15 @@ def print_summary(
     if stats["duplicates"]:
         print("  duplicate API rows ignored        {0:>10,}".format(stats["duplicates"]))
 
-    print_count_table("By library", by_library)
-    print_count_table("By metadata type", by_type)
+    print_count_table("By library", by_library, color)
+    print_count_table("By metadata type", by_type, color)
     if warnings:
-        print("\nWarnings")
+        print_section("Warnings", color)
         for warning in warnings:
-            print("  - {0}".format(warning))
+            print(style_text("  - {0}".format(warning), STYLE_YELLOW, color))
 
 
-def print_candidate_preview(spool_path, limit, total):
+def print_candidate_preview(spool_path, limit, total, color=False):
     if limit <= 0 or total <= 0:
         return
     id_width = 9
@@ -2149,14 +2221,14 @@ def print_candidate_preview(spool_path, limit, total):
         "SET_VALUE": "SET VALUE",
         "LOCK_ONLY": "LOCK ONLY",
     }
-    print("\nCandidate preview")
+    print_section("Candidate preview", color)
     print(
-        "  {0}  {1}  {2}  {3}".format(
+        style_text("  {0}  {1}  {2}  {3}".format(
             pad_display("ID", id_width),
             pad_display("Type", type_width),
             pad_display("Action", action_width),
             pad_display("Title", title_width),
-        )
+        ), STYLE_BOLD, color)
     )
     print("  {0}  {1}  {2}  {3}".format(
         "-" * id_width, "-" * type_width, "-" * action_width, "-" * title_width
@@ -2166,11 +2238,17 @@ def print_candidate_preview(spool_path, limit, total):
         if shown >= limit:
             break
         shown += 1
+        action_style = STYLE_CYAN if item["action"] == "LOCK_ONLY" else STYLE_YELLOW
+        action_cell = style_text(
+            pad_display(action_names.get(item["action"], item["action"]), action_width),
+            action_style,
+            color,
+        )
         print(
             "  {0}  {1}  {2}  {3}".format(
                 pad_display(item["metadata_id"], id_width),
                 pad_display(item["metadata_type_name"], type_width),
-                pad_display(action_names.get(item["action"], item["action"]), action_width),
+                action_cell,
                 pad_display(item["title"], title_width),
             )
         )
@@ -2188,11 +2266,11 @@ def print_candidate_preview(spool_path, limit, total):
         print("  ... {0:,} additional candidates; use --console to show details.".format(total - shown))
 
 
-def print_candidates(spool_path, limit, total, show_codepoints, heading):
+def print_candidates(spool_path, limit, total, show_codepoints, heading, color=False):
     if limit <= 0:
         return
     shown = 0
-    print("\n{0}".format(heading))
+    print_section(heading, color)
     for item in read_spool(spool_path):
         if shown >= limit:
             break
@@ -2209,7 +2287,8 @@ def print_candidates(spool_path, limit, total, show_codepoints, heading):
             item["metadata_type"],
             location,
         ))
-        print("  Action       : {0}".format(item["action"]))
+        action_style = STYLE_CYAN if item["action"] == "LOCK_ONLY" else STYLE_YELLOW
+        print("  Action       : {0}".format(style_text(item["action"], action_style, color)))
         print("  Title        : {0}".format(item["title"]))
         print("  Current sort : {0}".format("(NULL)" if item["title_sort"] is None else item["title_sort"]))
         print("  Sort base    : {0}".format(item["sort_base"]))
@@ -2242,23 +2321,23 @@ def apply_result_name(candidate_count, apply_stats):
     return "APPLY FAILED"
 
 
-def print_dry_run_result(stats, csv_path):
+def print_dry_run_result(stats, csv_path, color=False):
     result = dry_run_result_name(stats["candidates"])
-    print("\nRESULT: {0}".format(result))
+    print("\n{0}".format(result_line(result, color)))
     print("HTTP PUT requests: 0")
     if stats["candidates"]:
         print("Next step: review the preview or CSV, then rerun with --apply.")
     if csv_path:
-        print("\nArtifacts")
+        print_section("Artifacts", color)
         print("  CSV: {0}".format(csv_path.expanduser().resolve()))
     print("Exit code: 0")
 
 
-def print_apply_result(stats, apply_stats, run_logger, backup_bundle, csv_path):
+def print_apply_result(stats, apply_stats, run_logger, backup_bundle, csv_path, color=False):
     result = apply_result_name(stats["candidates"], apply_stats)
     exit_code = 4 if apply_stats["failed"] else 0
-    print("\nRESULT: {0}".format(result))
-    print("\nApply summary")
+    print("\n{0}".format(result_line(result, color)))
+    print_section("Apply summary", color)
     print("  Planned                         {0:>10,}".format(stats["candidates"]))
     print("  PUT succeeded                   {0:>10,}".format(apply_stats["put_succeeded"]))
     print("  Verified                        {0:>10,}".format(apply_stats["verified"]))
@@ -2267,17 +2346,17 @@ def print_apply_result(stats, apply_stats, run_logger, backup_bundle, csv_path):
     print("  Failed                          {0:>10,}".format(apply_stats["failed"]))
     reasons = failure_reason_items(apply_stats)
     if reasons:
-        print("\nFailure reasons")
+        print_section("Failure reasons", color)
         for reason, count in reasons:
-            print("  {0:<36} {1:>10,}".format(reason, count))
+            print(style_text("  {0:<36} {1:>10,}".format(reason, count), STYLE_RED, color))
     if run_logger.failure_samples:
-        print("\nFailure examples")
+        print_section("Failure examples", color)
         for sample in run_logger.failure_samples:
             heading = "ID {0} | {1}".format(sample.get("metadata_id") or "?", sample.get("title") or "(untitled)")
             print("  {0}".format(truncate_display(heading, terminal_width() - 2)))
             detail = "{0}: {1}".format(sample.get("error_code"), sample.get("error"))
             print("    {0}".format(truncate_display(detail, terminal_width() - 4)))
-    print("\nArtifacts")
+    print_section("Artifacts", color)
     if backup_bundle:
         print("  Backup  : {0}".format(backup_bundle))
     else:
@@ -2310,7 +2389,12 @@ def remove_temp(path):
 def main(argv=None):
     configure_output_encoding()
     args = parse_args(argv)
-    progress = ProgressReporter(enabled=not args.quiet_progress)
+    args.stdout_color = color_enabled(args.color, sys.stdout, args.output_format)
+    args.stderr_color = color_enabled(args.color, sys.stderr, args.output_format)
+    progress = ProgressReporter(
+        enabled=not args.quiet_progress,
+        color=args.stderr_color,
+    )
     preferences_path, preferences_attrs, preferences_errors = load_preferences(args.preferences)
 
     if args.restore_backup:
@@ -2335,7 +2419,7 @@ def main(argv=None):
                 }
             )
         else:
-            print("\nRESULT: RESTORE SUCCEEDED")
+            print("\n{0}".format(result_line("RESTORE SUCCEEDED", args.stdout_color)))
             print("  Restored from : {0}".format(bundle))
             print("  Target DB dir : {0}".format(db_dir))
             print("  Previous files: {0}".format(safety_dir))
@@ -2345,7 +2429,11 @@ def main(argv=None):
 
     if args.all_titles:
         print(
-            "WARNING: --all-unicode evaluates and locks Sort Title for every non-empty title.",
+            style_text(
+                "WARNING: --all-unicode evaluates and locks Sort Title for every non-empty title.",
+                STYLE_BOLD_YELLOW,
+                args.stderr_color,
+            ),
             file=sys.stderr,
         )
 
@@ -2359,7 +2447,11 @@ def main(argv=None):
     )
     if preferences_errors and preferences_path is None and args.article_strings is None:
         print(
-            "Warning: Preferences.xml could not be read; Plex default ArticleStrings will be used.",
+            style_text(
+                "Warning: Preferences.xml could not be read; Plex default ArticleStrings will be used.",
+                STYLE_YELLOW,
+                args.stderr_color,
+            ),
             file=sys.stderr,
         )
 
@@ -2449,12 +2541,14 @@ def main(argv=None):
                     stats["candidates"],
                     args.show_codepoints,
                     "Candidate details",
+                    args.stdout_color,
                 )
             else:
                 print_candidate_preview(
                     spool_path,
                     min(args.preview_limit, stats["candidates"]),
                     stats["candidates"],
+                    args.stdout_color,
                 )
 
         try:
@@ -2483,7 +2577,11 @@ def main(argv=None):
             elif stats["candidates"] and args.no_backup:
                 progress.phase(3, phase_total, "Database backup disabled")
                 print(
-                    "WARNING: applying without a database backup because --no-backup was specified.",
+                    style_text(
+                        "WARNING: applying without a database backup because --no-backup was specified.",
+                        STYLE_BOLD_YELLOW,
+                        args.stderr_color,
+                    ),
                     file=sys.stderr,
                 )
             else:
@@ -2524,7 +2622,10 @@ def main(argv=None):
                 apply_stats = Counter({"failed": 1, "failure:UNEXPECTED_RUN_ERROR": 1})
                 run_logger.failure_counts["UNEXPECTED_RUN_ERROR"] += 1
                 run_logger.finish(apply_stats)
-                print("Apply logs: {0}".format(run_dir), file=sys.stderr)
+                print(
+                    style_text("Apply logs: {0}".format(run_dir), STYLE_YELLOW, args.stderr_color),
+                    file=sys.stderr,
+                )
                 return emit_error(args, 5, "apply stopped unexpectedly: {0}".format(exc))
             run_logger.finish(apply_stats)
             if csv_handle:
@@ -2556,7 +2657,14 @@ def main(argv=None):
             if args.output_format == "json":
                 emit_json(report)
             else:
-                print_apply_result(stats, apply_stats, run_logger, backup_bundle, args.csv)
+                print_apply_result(
+                    stats,
+                    apply_stats,
+                    run_logger,
+                    backup_bundle,
+                    args.csv,
+                    args.stdout_color,
+                )
             return exit_code
 
         output_dry_run(spool_path, writer)
@@ -2571,7 +2679,7 @@ def main(argv=None):
         if args.output_format == "json":
             emit_json(report)
         else:
-            print_dry_run_result(stats, args.csv)
+            print_dry_run_result(stats, args.csv, args.stdout_color)
         return 0
     finally:
         if csv_handle:
