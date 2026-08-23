@@ -12,6 +12,7 @@ Default behavior is a dry run limited to titles containing Korean characters.
 import argparse
 import csv
 import datetime
+import errno
 import glob
 import hashlib
 import json
@@ -32,7 +33,7 @@ from pathlib import Path
 
 
 PROGRAM = "plex_nfkd_title_sort_api"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 DEFAULT_PLEX_URL = "http://127.0.0.1:32400"
 DEFAULT_ARTICLE_STRINGS = ("the", "das", "der", "a", "an", "el", "la")
 MAIN_DB_NAME = "com.plexapp.plugins.library.db"
@@ -372,7 +373,7 @@ class ApplyRunLogger:
             "expected_title_sort": item.get("target_title_sort"),
             "actual_title": diagnostics.get("actual_title"),
             "actual_title_sort": diagnostics.get("actual_title_sort"),
-            "expected_locked": True,
+            "expected_locked": diagnostics.get("expected_locked", True),
             "actual_locked": diagnostics.get("actual_locked"),
             "returned_fields": returned_fields,
             "error": redact_text(error, self.secrets),
@@ -397,12 +398,13 @@ class ApplyRunLogger:
             stage,
             (
                 "{0}: {1}; expected_title_sort={2!r}; actual_title_sort={3!r}; "
-                "expected_locked=true; actual_locked={4}; response={5}"
+                "expected_locked={4}; actual_locked={5}; response={6}"
             ).format(
                 error_code,
                 error,
                 item.get("target_title_sort"),
                 diagnostics.get("actual_title_sort"),
+                diagnostics.get("expected_locked", True),
                 diagnostics.get("actual_locked"),
                 response_file or "(not available)",
             ),
@@ -433,8 +435,12 @@ class ApplyRunLogger:
         self.event(
             "INFO",
             "RUN_END",
-            "Apply run finished; PUT succeeded={0}, verified={1}, failed={2}".format(
-                apply_stats["put_succeeded"], apply_stats["verified"], apply_stats["failed"]
+            "Apply run finished; PUT succeeded={0}, skipped before PUT={1}, "
+            "verified={2}, failed={3}".format(
+                apply_stats["put_succeeded"],
+                apply_stats["skipped_before_put"],
+                apply_stats["verified"],
+                apply_stats["failed"],
             ),
         )
         self.failure_handle.close()
@@ -744,6 +750,14 @@ def parse_args(argv=None):
         action="store_true",
         help="required for --restore-backup after stopping Plex Media Server",
     )
+    backup_group.add_argument(
+        "--allow-plex-url-mismatch",
+        action="store_true",
+        help=(
+            "allow restore when --plex-url differs from the URL stored in the backup manifest; "
+            "use only after independently verifying the target server"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.page_size < 1 or args.page_size > 5000:
@@ -768,6 +782,8 @@ def parse_args(argv=None):
         parser.error("--no-backup is only valid with --apply")
     if args.confirm_plex_stopped and not args.restore_backup:
         parser.error("--confirm-plex-stopped is only valid with --restore-backup")
+    if args.allow_plex_url_mismatch and not args.restore_backup:
+        parser.error("--allow-plex-url-mismatch is only valid with --restore-backup")
     if args.log_dir is not None and not args.apply:
         parser.error("--log-dir is only valid with --apply")
     return args
@@ -1053,6 +1069,20 @@ def load_backup_manifest(backup_path):
     return bundle, manifest
 
 
+def connection_was_refused(error):
+    current = error
+    seen = set()
+    refused_codes = {errno.ECONNREFUSED, 61, 10061}
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ConnectionRefusedError):
+            return True
+        if getattr(current, "errno", None) in refused_codes:
+            return True
+        current = getattr(current, "reason", None) or getattr(current, "__cause__", None)
+    return False
+
+
 def plex_server_is_reachable(base_url, timeout=3.0):
     url = base_url.rstrip("/") + "/identity"
     request = urllib.request.Request(url, method="GET")
@@ -1061,8 +1091,35 @@ def plex_server_is_reachable(base_url, timeout=3.0):
             return True
     except urllib.error.HTTPError:
         return True
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return False
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        if connection_was_refused(exc):
+            return False
+        raise RuntimeError(
+            "unable to confirm that Plex is stopped because the identity check failed ambiguously: "
+            "{0}".format(exc)
+        ) from exc
+
+
+def fsync_file(path):
+    mode = "rb+" if os.name == "nt" else "rb"
+    with path.open(mode) as handle:
+        os.fsync(handle.fileno())
+
+
+def fsync_directory(path):
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(str(path), flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def copy_file_with_fsync(source, destination):
+    shutil.copy2(str(source), str(destination))
+    fsync_file(destination)
 
 
 def preserve_file_metadata(path, previous_stat, backup_entry):
@@ -1091,12 +1148,90 @@ def preserve_file_metadata(path, previous_stat, backup_entry):
             print("Warning: unable to restore file ownership for {0}".format(path), file=sys.stderr)
 
 
+def remove_restore_staging_files(paths):
+    for path in paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(
+                "Warning: unable to remove restore staging file {0}: {1}".format(path, exc),
+                file=sys.stderr,
+            )
+
+
+def rollback_active_database_files(
+    db_dir,
+    safety_dir,
+    names,
+    sidecar_names,
+    original_exists,
+    previous_stats,
+    manifest_files,
+):
+    rollback_stages = []
+    for name in names:
+        rollback_stage = db_dir / (name + ".rollback-partial")
+        if rollback_stage.exists():
+            raise RuntimeError("rollback staging file already exists: {0}".format(rollback_stage))
+        rollback_stages.append(rollback_stage)
+
+    try:
+        for name in sidecar_names:
+            active_sidecar = db_dir / name
+            if active_sidecar.exists():
+                active_sidecar.unlink()
+
+        for name, rollback_stage in zip(names, rollback_stages):
+            target = db_dir / name
+            if original_exists[name]:
+                copy_file_with_fsync(safety_dir / name, rollback_stage)
+                os.replace(str(rollback_stage), str(target))
+                preserve_file_metadata(
+                    target,
+                    previous_stats.get(name),
+                    manifest_files[name],
+                )
+            elif target.exists():
+                target.unlink()
+
+        for name in sidecar_names:
+            target = db_dir / name
+            if original_exists[name]:
+                rollback_stage = db_dir / (name + ".rollback-partial")
+                if rollback_stage.exists():
+                    raise RuntimeError(
+                        "rollback staging file already exists: {0}".format(rollback_stage)
+                    )
+                rollback_stages.append(rollback_stage)
+                copy_file_with_fsync(safety_dir / name, rollback_stage)
+                os.replace(str(rollback_stage), str(target))
+        fsync_directory(db_dir)
+    finally:
+        remove_restore_staging_files(rollback_stages)
+
+
 def restore_backup_bundle(args, preferences_path=None, progress=None):
+    bundle, manifest = load_backup_manifest(args.restore_backup)
+    manifest_plex_url = (manifest.get("plex_url") or "").rstrip("/")
+    requested_plex_url = args.plex_url.rstrip("/")
+    if (
+        manifest_plex_url
+        and manifest_plex_url != requested_plex_url
+        and not getattr(args, "allow_plex_url_mismatch", False)
+    ):
+        raise RuntimeError(
+            "the restore Plex URL does not match the URL recorded in the backup manifest: "
+            "recorded={0}, requested={1}. Use the recorded URL or explicitly supply "
+            "--allow-plex-url-mismatch after verifying the target server.".format(
+                manifest_plex_url, requested_plex_url
+            )
+        )
     if plex_server_is_reachable(args.plex_url, timeout=min(args.timeout, 3.0)):
         raise RuntimeError(
             "Plex Media Server is still reachable. Stop it completely before restoring a database."
         )
-    bundle, manifest = load_backup_manifest(args.restore_backup)
     manifest_files = {entry["name"]: entry for entry in manifest["files"]}
     db_dir = resolve_db_dir(args, preferences_path)
     if db_dir is None:
@@ -1117,6 +1252,18 @@ def restore_backup_bundle(args, preferences_path=None, progress=None):
 
     names = (MAIN_DB_NAME, BLOBS_DB_NAME)
     sidecar_names = tuple(name + suffix for name in names for suffix in ("-wal", "-shm"))
+    reserved_staging_paths = tuple(
+        db_dir / (name + suffix)
+        for name in names + sidecar_names
+        for suffix in (".restore-partial", ".rollback-partial")
+    )
+    for reserved_path in reserved_staging_paths:
+        if reserved_path.exists():
+            raise RuntimeError(
+                "restore cannot start while a reserved staging file exists: {0}".format(
+                    reserved_path
+                )
+            )
     backup_bytes = sum((bundle / name).stat().st_size for name in names)
     current_bytes = sum(
         (db_dir / name).stat().st_size
@@ -1128,6 +1275,9 @@ def restore_backup_bundle(args, preferences_path=None, progress=None):
     if shutil.disk_usage(str(safety_dir)).free < current_bytes + 32 * 1024 * 1024:
         raise RuntimeError("insufficient free space for the pre-restore safety copy")
     previous_stats = {}
+    original_exists = {
+        name: (db_dir / name).exists() for name in names + sidecar_names
+    }
     staged = []
     if progress:
         progress.detail("Preserving current database files in {0}".format(safety_dir))
@@ -1136,36 +1286,66 @@ def restore_backup_bundle(args, preferences_path=None, progress=None):
     for name in names + sidecar_names:
         current = db_dir / name
         if current.exists():
-            shutil.copy2(str(current), str(safety_dir / name))
+            safety_copy = safety_dir / name
+            copy_file_with_fsync(current, safety_copy)
+            if sha256_file(current) != sha256_file(safety_copy):
+                raise RuntimeError("pre-restore safety copy validation failed: {0}".format(current))
         if name in names:
             previous_stats[name] = current.stat() if current.exists() else None
 
+    active_changes_started = False
     try:
         for name in names:
             source = bundle / name
             stage = db_dir / (name + ".restore-partial")
             if stage.exists():
                 raise RuntimeError("restore staging file already exists: {0}".format(stage))
-            shutil.copy2(str(source), str(stage))
+            staged.append((name, stage))
+            copy_file_with_fsync(source, stage)
             if sha256_file(stage) != sha256_file(source):
                 raise RuntimeError("restore staging checksum failed: {0}".format(stage))
-            with stage.open("rb+") as stage_handle:
-                os.fsync(stage_handle.fileno())
-            staged.append((name, stage))
-        for name, stage in staged:
-            target = db_dir / name
-            os.replace(str(stage), str(target))
-            preserve_file_metadata(target, previous_stats.get(name), manifest_files[name])
+
+        active_changes_started = True
         for name in sidecar_names:
             sidecar = db_dir / name
             if sidecar.exists():
                 sidecar.unlink()
-    except Exception:
-        print(
-            "Restore failed. The pre-restore database copies are available at: {0}".format(safety_dir),
-            file=sys.stderr,
-        )
-        raise
+        fsync_directory(db_dir)
+
+        for name, stage in staged:
+            target = db_dir / name
+            os.replace(str(stage), str(target))
+            preserve_file_metadata(target, previous_stats.get(name), manifest_files[name])
+        fsync_directory(db_dir)
+    except Exception as restore_error:
+        remove_restore_staging_files(stage for _, stage in staged)
+        if not active_changes_started:
+            raise RuntimeError(
+                "restore staging failed before active databases were changed; safety copies are at: "
+                "{0}".format(safety_dir)
+            ) from restore_error
+        try:
+            rollback_active_database_files(
+                db_dir,
+                safety_dir,
+                names,
+                sidecar_names,
+                original_exists,
+                previous_stats,
+                manifest_files,
+            )
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "restore failed and automatic rollback also failed; do not start Plex. "
+                "Recover all database and WAL/SHM files from {0}. Restore error: {1}. "
+                "Rollback error: {2}".format(safety_dir, restore_error, rollback_error)
+            ) from restore_error
+        raise RuntimeError(
+            "restore failed, but the original database and WAL/SHM files were restored "
+            "automatically from {0}: {1}".format(safety_dir, restore_error)
+        ) from restore_error
+    finally:
+        remove_restore_staging_files(stage for _, stage in staged)
     return db_dir, bundle, safety_dir
 
 
@@ -1222,9 +1402,17 @@ def derive_plex_sort_base(title, article_strings):
 
 def make_sort_key_plan(title, current_title_sort, article_strings):
     if current_title_sort not in (None, ""):
-        sort_base = current_title_sort
-        source = "EXISTING_TITLE_SORT"
-        if title.endswith(sort_base):
+        sort_base, removed_from_existing = derive_plex_sort_base(
+            current_title_sort, article_strings
+        )
+        source = (
+            "SANITIZED_EXISTING_TITLE_SORT"
+            if removed_from_existing
+            else "EXISTING_TITLE_SORT"
+        )
+        if removed_from_existing:
+            removed_prefix = removed_from_existing
+        elif title.endswith(sort_base):
             removed_prefix = title[: len(title) - len(sort_base)]
         else:
             removed_prefix = ""
@@ -1463,6 +1651,12 @@ def fetch_one_library_detail(client, metadata_id):
 def fetch_playlist_detail(client, metadata_id):
     root, _ = client.get("/playlists/{0}".format(metadata_id), params={"includeMeta": 1})
     return next(direct_metadata_elements(root), None)
+
+
+def fetch_candidate_detail(client, item):
+    if item.get("api_kind") == "playlist":
+        return fetch_playlist_detail(client, item["metadata_id"])
+    return fetch_one_library_detail(client, item["metadata_id"])
 
 
 def enrich_library_items(client, items):
@@ -1770,6 +1964,67 @@ def apply_candidate(client, item):
         )
 
 
+def equivalent_snapshot_title_sort(title, left, right):
+    if left == right:
+        return True
+    return (left is None and right == title) or (right is None and left == title)
+
+
+def verify_planned_state(item, element):
+    expected_locked = bool(item.get("title_sort_locked"))
+    if element is None:
+        return (
+            False,
+            "ITEM_NOT_FOUND_BEFORE_APPLY",
+            "item was not found during the pre-apply state check; no PUT was sent",
+            {
+                "actual_title": None,
+                "actual_title_sort": None,
+                "actual_locked": None,
+                "expected_locked": expected_locked,
+                "returned_fields": [],
+            },
+        )
+
+    current_title = element.attrib.get("title")
+    current_sort = element.attrib.get("titleSort")
+    returned_fields = [
+        dict(child.attrib) for child in element if local_name(child.tag) == "Field"
+    ]
+    current_locked = any(
+        field.get("name") == "titleSort" and field.get("locked") == "1"
+        for field in returned_fields
+    )
+    diagnostics = {
+        "actual_title": current_title,
+        "actual_title_sort": current_sort,
+        "actual_locked": current_locked,
+        "expected_locked": expected_locked,
+        "returned_fields": returned_fields,
+    }
+    changed_fields = []
+    if current_title != item.get("title"):
+        changed_fields.append("title")
+    if not equivalent_snapshot_title_sort(
+        current_title,
+        item.get("title_sort"),
+        current_sort,
+    ):
+        changed_fields.append("titleSort")
+    if current_locked != expected_locked:
+        changed_fields.append("titleSort.locked")
+    if changed_fields:
+        return (
+            False,
+            "STALE_PLAN",
+            "metadata changed after the scan ({0}); no PUT was sent".format(
+                ", ".join(changed_fields)
+            ),
+            diagnostics,
+        )
+    return True, "", "", diagnostics
+
+
 def verify_element(item, element):
     if element is None:
         return (
@@ -1835,6 +2090,48 @@ def apply_batch(client, batch, writer, apply_stats, run_logger):
     library_successes = []
     playlist_successes = []
     for item in batch:
+        try:
+            preflight_element = fetch_candidate_detail(client, item)
+        except Exception as exc:
+            item["result"] = "PRE_APPLY_FAILED"
+            item["error"] = "pre-apply state check failed: {0}".format(exc)
+            apply_stats["failed"] += 1
+            apply_stats["skipped_before_put"] += 1
+            apply_stats["failure:PRE_APPLY_FETCH_ERROR"] += 1
+            run_logger.failed(
+                item,
+                "PRE_APPLY_CHECK",
+                "PRE_APPLY_FETCH_ERROR",
+                item["error"],
+                diagnostics={
+                    "expected_locked": bool(item.get("title_sort_locked")),
+                },
+            )
+            if writer:
+                writer.writerow(csv_row(item))
+            continue
+
+        current, error_code, error, diagnostics = verify_planned_state(
+            item, preflight_element
+        )
+        if not current:
+            item["result"] = "SKIPPED_STALE_PLAN"
+            item["error"] = error
+            apply_stats["failed"] += 1
+            apply_stats["skipped_before_put"] += 1
+            apply_stats["failure:{0}".format(error_code)] += 1
+            run_logger.failed(
+                item,
+                "PRE_APPLY_CHECK",
+                error_code,
+                error,
+                diagnostics=diagnostics,
+                element=preflight_element,
+            )
+            if writer:
+                writer.writerow(csv_row(item))
+            continue
+
         try:
             apply_candidate(client, item)
             item["result"] = "APPLIED_PENDING_VERIFY"
@@ -2083,6 +2380,9 @@ def build_scan_report(
             },
             "sort_key_source": {
                 "existing_title_sort": stats["source:EXISTING_TITLE_SORT"],
+                "sanitized_existing_title_sort": stats[
+                    "source:SANITIZED_EXISTING_TITLE_SORT"
+                ],
                 "derived_plex_rules": stats["source:DERIVED_PLEX_RULES"],
             },
         },
@@ -2196,6 +2496,10 @@ def print_summary(
     print_section("Sort-key source among candidates", color)
     if stats["source:EXISTING_TITLE_SORT"]:
         print("  Existing Plex/custom titleSort    {0:>10,}".format(stats["source:EXISTING_TITLE_SORT"]))
+    if stats["source:SANITIZED_EXISTING_TITLE_SORT"]:
+        print("  Sanitized existing titleSort      {0:>10,}".format(
+            stats["source:SANITIZED_EXISTING_TITLE_SORT"]
+        ))
     if stats["source:DERIVED_PLEX_RULES"]:
         print("  Derived using Plex rules          {0:>10,}".format(stats["source:DERIVED_PLEX_RULES"]))
     if stats["duplicates"]:
@@ -2340,6 +2644,7 @@ def print_apply_result(stats, apply_stats, run_logger, backup_bundle, csv_path, 
     print_section("Apply summary", color)
     print("  Planned                         {0:>10,}".format(stats["candidates"]))
     print("  PUT succeeded                   {0:>10,}".format(apply_stats["put_succeeded"]))
+    print("  Skipped before PUT              {0:>10,}".format(apply_stats["skipped_before_put"]))
     print("  Verified                        {0:>10,}".format(apply_stats["verified"]))
     print("    Explicit titleSort            {0:>10,}".format(apply_stats["verified_explicit"]))
     print("    Plex title fallback           {0:>10,}".format(apply_stats["verified_title_fallback"]))
@@ -2636,6 +2941,7 @@ def main(argv=None):
             report["apply"] = {
                 "planned": stats["candidates"],
                 "put_succeeded": apply_stats["put_succeeded"],
+                "skipped_before_put": apply_stats["skipped_before_put"],
                 "verified": apply_stats["verified"],
                 "verified_explicit_title_sort": apply_stats["verified_explicit"],
                 "verified_plex_title_fallback": apply_stats["verified_title_fallback"],

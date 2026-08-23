@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+plex_nfkd_backups/
+plex_nfkd_logs/
