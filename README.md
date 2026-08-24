@@ -20,10 +20,11 @@ The default operation is a dry run limited to titles that contain Korean
 characters. A dry run sends zero HTTP PUT requests and does not open either
 Plex database.
 
-When Plex already supplies a non-empty titleSort, the tool preserves that sort
-key and applies NFKD only to that value. This keeps Plex or user-defined sorting
-choices such as removed articles and punctuation. If titleSort is missing or
-empty, the tool derives a Plex-style sort key before normalization.
+When Plex already supplies a non-empty titleSort, the tool first removes any
+leading punctuation, symbols, whitespace, or configured grammatical article,
+then applies NFKD. Meaningful custom keys such as `Matrix, The` remain intact.
+If titleSort is missing or empty, the tool derives the same Plex-style sort key
+from title before normalization.
 
 ## Important Safety Notice
 
@@ -37,8 +38,13 @@ Always review a dry run before using --apply.
   sending API changes, unless --no-backup is explicitly supplied.
 - The backup directory must be outside the Plex Media Server data directory.
 - Every applied value and lock is read back from the API and verified.
+- Every candidate is read again immediately before PUT. If title, titleSort, or
+  its lock changed after the scan, the candidate is skipped without a PUT.
 - Apply failures receive per-run diagnostic logs and saved API responses.
-- Database restore is refused while Plex Media Server is reachable.
+- Database restore is refused while Plex Media Server is reachable or when its
+  stopped state cannot be confirmed unambiguously.
+- A failed restore automatically rolls back both databases and all WAL/SHM
+  sidecars from the pre-restore safety copies.
 
 The database files are used only for backup and guarded restore. They are never
 used as the metadata source.
@@ -121,9 +127,11 @@ The summary separates:
 - already-compliant Plex title fallback values
 - titleSort value edits
 - Sort Title lock additions
+- candidates skipped before PUT because their state changed or could not be read
 - set-and-lock, set-only, and lock-only actions
 - current titleSort status
 - existing versus derived sort-key sources
+- existing titleSort values that required Plex-style prefix sanitization
 - candidates by library and metadata type
 
 The default preview shows up to 20 candidates. Use --preview-limit to change
@@ -156,26 +164,29 @@ succeeds. The backup can be disabled only with the explicit --no-backup option.
 
 The target is selected in this order:
 
-1. Preserve a non-empty titleSort returned by Plex as the sort base.
-2. Otherwise remove leading whitespace, punctuation, and symbols from title.
+1. Start with a non-empty titleSort returned by Plex, or title when titleSort is
+   missing or empty.
+2. Remove leading whitespace, punctuation, and symbols from that value.
 3. Remove a leading article listed in Plex ArticleStrings.
-4. Normalize the resulting sort base with Unicode NFKD.
-5. Set and lock the target through the Plex API.
+4. Preserve the remainder, including meaningful custom suffixes or ordering.
+5. Normalize the resulting sort base with Unicode NFKD.
+6. Set and lock the target through the Plex API.
 
 Conceptually:
 
 ~~~python
 if current_title_sort not in (None, ""):
-    sort_base = current_title_sort
+    sort_base, _ = derive_plex_sort_base(current_title_sort, article_strings)
 else:
-    sort_base = derive_plex_sort_base(title, article_strings)
+    sort_base, _ = derive_plex_sort_base(title, article_strings)
 
 target_title_sort = unicodedata.normalize("NFKD", sort_base)
 ~~~
 
 This differs intentionally from applying NFKD directly to title in every case.
-For example, if Plex has already removed an article from its Sort Title, that
-choice remains intact.
+For example, if Plex has already removed an article or uses a custom key such as
+`Matrix, The`, that meaningful ordering remains intact. A redundant key such as
+`The Matrix` is sanitized to `Matrix` before normalization.
 
 ArticleStrings is read from Preferences.xml. If the setting is unavailable,
 the following Plex defaults are used:
@@ -471,6 +482,8 @@ Result values:
 - DRY_RUN: planned without sending changes
 - VERIFIED: value and lock confirmed after PUT
 - APPLY_FAILED: API PUT failed
+- PRE_APPLY_FAILED: the fresh state could not be read, so no PUT was sent
+- SKIPPED_STALE_PLAN: metadata changed after scanning, so no PUT was sent
 - VERIFY_FAILED: expected value or lock could not be confirmed
 
 nfkd_title is NFKD(title) for comparison. The actual applied value is
@@ -515,6 +528,9 @@ Inspect failures.csv and responses before retrying.
 
 Common failure codes:
 
+- PRE_APPLY_FETCH_ERROR
+- ITEM_NOT_FOUND_BEFORE_APPLY
+- STALE_PLAN
 - APPLY_REQUEST_ERROR
 - VERIFY_FETCH_ERROR
 - ITEM_NOT_FOUND
@@ -525,8 +541,10 @@ Common failure codes:
 ## Backup Restore
 
 Stop Plex Media Server completely before restore. The script refuses to
-restore while the Plex identity endpoint is reachable and also requires the
-explicit --confirm-plex-stopped option.
+restore while the Plex identity endpoint is reachable. A timeout, DNS failure,
+TLS error, or other ambiguous identity-check failure also blocks restore; only
+an explicit connection refusal is accepted as an automatic stopped-state
+signal. The explicit --confirm-plex-stopped option is always required.
 
 Example for Synology DSM 7:
 
@@ -544,7 +562,23 @@ Before replacement, the current main database, blobs database, and any WAL/SHM
 sidecars are copied to a pre-restore-current-db-* safety directory. Restore
 files are verified against the SHA-256 backup manifest, copied through staging
 files, and installed while preserving existing mode and ownership when
-possible.
+possible. WAL/SHM sidecars are removed from the active directory before the
+restored databases are installed. If either database installation fails, the
+tool automatically restores both original databases and every original
+sidecar. If automatic rollback itself fails, the tool prints a critical warning
+not to start Plex and identifies the safety-copy directory.
+
+The Plex URL used for restore must match the URL recorded in the backup
+manifest. If the server address intentionally changed, verify the target and
+use the explicit override:
+
+~~~bash
+python3 plex_nfkd_title_sort_api.py \
+  --restore-backup /volume1/Backups/Plex-NFKD/plex-db-backup-YYYYMMDD-HHMMSS \
+  --confirm-plex-stopped \
+  --allow-plex-url-mismatch \
+  --plex-url http://127.0.0.1:32400
+~~~
 
 ## Performance and Implementation Details
 
@@ -556,6 +590,7 @@ possible.
 - Streams candidates through a temporary JSONL file.
 - Opens CSV output before starting API changes.
 - Backs up both databases before the first PUT.
+- Re-reads every candidate immediately before PUT and skips stale plans.
 - Records database size, SQLite page count, and SHA-256 in the manifest.
 - Refuses backup destinations inside the Plex data directory.
 - Verifies successful library changes with batched API reads.
@@ -563,8 +598,17 @@ possible.
 
 ## Validation
 
-The project has been tested end to end with a mock Plex HTTP server and
+The repository includes standard-library unit and regression tests under
+`tests/`, plus a GitHub Actions matrix for Python 3.9, 3.11, and 3.13. The
+project has also been tested end to end with a mock Plex HTTP server and
 synthetic SQLite databases.
+
+Run the tracked tests locally:
+
+~~~bash
+python3 -m py_compile plex_nfkd_title_sort_api.py
+python3 -m unittest discover -s tests -v
+~~~
 
 ~~~text
 SYNTAX_IMPORT=OK
