@@ -66,12 +66,14 @@
 - Add or update regression tests for changed planning, API, output, backup, restore, or failure-handling behavior. Prefer mocks and temporary synthetic SQLite databases.
 - Automated tests must not require a live Plex server, use a real Plex token, modify a real Plex database, or send changes to a live library.
 - Manual Plex validation is optional unless explicitly requested. Default to dry-run and do not perform live `--apply` or `--restore-backup` validation without explicit authorization and an identified safe target.
-- Re-run the full tracked checks after material changes or base updates and before a pull request is merged.
+- Re-run the full tracked checks after material changes, base updates, or rebases and before a pull request is merged.
 
 ## Git Workflow
 
 - Start each change from an up-to-date `origin/main`.
-- If `origin/main` advances after a pull request is opened, report the drift before final review or merge.
+- Before final review or merge, fetch the remote and rebase the pull request branch onto the latest target branch, normally `origin/main`.
+- Do not merge the target branch into the pull request branch as a substitute for the required rebase.
+- If the rebase rewrites commits that were already pushed, update the remote branch with `git push --force-with-lease`; never use an unconditional force push.
 - Do not commit or push directly to `main`.
 - Create a dedicated branch for each logical change.
 - Keep unrelated changes in separate branches and pull requests.
@@ -89,7 +91,8 @@
 - Keep each commit focused on one logical change.
 - Use a concise, imperative subject that describes the result.
 - Include motivation, significant implementation details, safety impact, and validation results in the body when useful.
-- Preserve pull-request commit history; do not rebase, amend, squash, force-push, or otherwise rewrite commits unless explicitly requested.
+- Rebase only as required by the pre-merge workflow or when explicitly requested. During the required rebase, preserve commit order and messages.
+- Apart from the required pre-merge rebase, do not amend, squash, reorder, or otherwise rewrite commits unless explicitly requested.
 - Do not include credentials, personal paths, sensitive data, or identifying sample data.
 
 ## Pull Requests
