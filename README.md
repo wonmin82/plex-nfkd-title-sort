@@ -350,7 +350,109 @@ Long operations report phases to stderr:
 [4/4] Applying and verifying changes
 ~~~
 
+Version 1.5.0 adds a live progress panel on color-capable interactive terminals.
 Hide phase and progress messages with --quiet-progress.
+
+### Scan Progress
+
+One scan panel stays in place as the scan moves between libraries, metadata
+types, and playlists. The current library/type appears first, followed by
+adjacent, aligned library and query progress bars. Cumulative scanned/candidate
+counts and timing sit together below the bars. For example:
+
+~~~text
+Scanning metadata
+Library   2/4 · TV · Episode (section 4)
+Libraries [======------------------] 25% · 1/4 processed
+Query     [==============----------] 60% · 6,000/10,000 items
+Total scanned 8,500 · Candidates 240
+Elapsed 00:18 · 472.2/s
+~~~
+
+Both bars use the same width. Narrow terminals shorten them together or omit
+the bars while retaining their counts and percentages; cumulative counters
+split into shorter rows below them. Unknown query totals still show counts only.
+
+`Library 2/4` means the second of four selected libraries is being scanned.
+`Libraries` advances after every selected library has finished all its type
+queries or has been skipped; it does not advance at each type transition.
+Its percentage counts libraries equally, not items or estimated remaining
+time. `Skipped` identifies libraries with unknown types or no supported
+query; individual unsupported types remain in the final warnings. A processed
+library is not a guarantee that every optional type was available.
+
+The denominator uses the already-fetched section list after `--section`
+filtering, with no additional API requests. Playlists are a separate step:
+`Current Playlists · Playlist` replaces the library ordinal while the library
+bar retains its final value. Playlist-only and zero-library runs show
+`Libraries 0 selected`, not a misleading 100% or 1/0. Finishing all libraries
+does not mean playlist scanning or the entire run has finished.
+
+The `Query` percentage belongs to the **current library/type query**, not the
+entire scan. Elapsed time and speed cover the whole scan phase; speed is the
+average number of unique items scanned per second. The counters and timer do
+not reset at library/type or playlist transitions, and those transitions do
+not leave completed panels in the terminal scrollback. Candidate counts are
+updated after detail reads.
+
+When Plex does not return a usable total, the query shows a count without
+a bar or percentage. No extra API requests are made to estimate a global
+total. Listings are paginated and details are still read in bounded batches;
+the query counter advances when each page and its details have been processed.
+New candidates may appear while that page is being processed.
+
+At scan completion, the text summary shows scan duration, scanned and selected
+rows, already-compliant items, and candidates, followed by planned value edits,
+lock additions, and the candidate preview. Value edits and lock additions can
+overlap on the same candidate.
+
+### Backup and Apply Progress
+
+Each database backup shows its file number (1/2 or 2/2) and actual SQLite
+page-copy progress. A separate `Checking SHA-256` stage follows copying;
+100% copied does not mean the backup bundle is ready. Apply still waits until
+both files and the backup manifest have been written successfully.
+
+The apply panel updates at individual pre-apply checks, PUTs, and verification
+results, rather than only at the end of each batch. For example:
+
+~~~text
+Verifying library updates
+Processed [==============----------] 60% · 192/320 items
+Verified 190 · Failed 2 · Skipped 1 · PUT OK 191
+Elapsed 00:24 · 8.0/s · ETA ~00:16
+~~~
+
+`Processed` counts items that reached a final verified or failed outcome.
+`PUT OK` counts successful update requests, including those awaiting
+verification; it is not a verified-success count. `Skipped` is the subset of
+failed items for which no PUT was sent. The panel never treats 100% processed
+as overall success. The final result depends on verification and failures.
+
+Apply speed and ETA use the average completed-item rate for the apply phase.
+ETA is approximate, appears only after at least three seconds and a completed
+item, and may vary while batches are verified. Narrow panels omit speed/ETA
+and split the essential counters into shorter rows. The result summary puts
+verified, failed, skipped, total elapsed time, and artifact paths first.
+
+If apply aborts unexpectedly, completed PUT and verification counts are
+retained in the error message and, when diagnostic files remain writable,
+`summary.json`. `apply_stats.run_errors`
+records run-level failures separately from failed items, and the process exits
+with code 5. Some successful PUTs may remain unverified; inspect the logs
+before retrying.
+
+Progress is event-driven: the screen refreshes at most five times per second
+while work advances. During a blocking HTTP request or checksum calculation,
+the last stage remains visible until that operation returns. Terminal width
+is respected when drawing live rows. A resize starts a fresh panel so cursor
+movement does not overwrite reflowed output.
+
+Redirected stderr uses ordinary progress snapshots at most once every five
+seconds during the whole scan or apply phase. Library/type and playlist
+transitions do not force extra snapshots. Phase boundaries and the latest
+pending snapshot are always emitted, including when work fails. No terminal
+cursor controls are written to redirected logs.
 
 ### ANSI Color Safety
 
@@ -384,10 +486,11 @@ python3 plex_nfkd_title_sort_api.py --dry-run --color never
 NO_COLOR=1 python3 plex_nfkd_title_sort_api.py --dry-run
 ~~~
 
-Interactive progress uses a carriage return only when stderr is a terminal.
-When stderr is redirected, every progress update is written as an ordinary
-line without carriage-return control behavior. Avoid --color always when the
-destination is a file unless ANSI sequences are intentionally required.
+Live panels use cursor controls only on an interactive stderr with color
+enabled. `--color never`, `NO_COLOR`, `TERM=dumb`, and JSON mode use ordinary
+line-based progress instead. JSON mode suppresses all generated ANSI sequences,
+even when color is forced. Avoid --color always when the destination is a file
+unless ANSI color in phase messages is intentionally required.
 
 Every successful run prints a clear result and exit code:
 
@@ -599,7 +702,9 @@ python3 plex_nfkd_title_sort_api.py \
 ## Validation
 
 The repository includes standard-library unit and regression tests under
-`tests/`, plus a GitHub Actions matrix for Python 3.9, 3.11, and 3.13. The
+`tests/`, including progress rendering, throttling, query totals, dry-run
+isolation, backup ordering, per-item verification progress, and aborted-run
+statistics. The GitHub Actions matrix runs Python 3.9, 3.11, and 3.13. The
 project has also been tested end to end with a mock Plex HTTP server and
 synthetic SQLite databases.
 
