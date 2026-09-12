@@ -33,7 +33,7 @@ from pathlib import Path
 
 
 PROGRAM = "plex_nfkd_title_sort_api"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 DEFAULT_PLEX_URL = "http://127.0.0.1:32400"
 DEFAULT_ARTICLE_STRINGS = ("the", "das", "der", "a", "an", "el", "la")
 MAIN_DB_NAME = "com.plexapp.plugins.library.db"
@@ -435,12 +435,13 @@ class ApplyRunLogger:
         self.event(
             "INFO",
             "RUN_END",
-            "Apply run finished; PUT succeeded={0}, skipped before PUT={1}, "
+            "Apply run {4}; PUT succeeded={0}, skipped before PUT={1}, "
             "verified={2}, failed={3}".format(
                 apply_stats["put_succeeded"],
                 apply_stats["skipped_before_put"],
                 apply_stats["verified"],
                 apply_stats["failed"],
+                "aborted" if apply_stats["run_errors"] else "finished",
             ),
         )
         self.failure_handle.close()
@@ -550,51 +551,206 @@ def result_line(result, enabled):
     return style_text("RESULT: {0}".format(result), result_style(result), enabled)
 
 
+def duration_text(seconds):
+    seconds = max(0, int(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return "{0:02}:{1:02}:{2:02}".format(hours, minutes, seconds)
+    return "{0:02}:{1:02}".format(minutes, seconds)
+
+
+def progress_text(value):
+    # API names must not inject terminal controls into the live display.
+    return "".join(" " if unicodedata.category(ch).startswith("C") else ch for ch in str(value))
+
+
 class ProgressReporter:
-    def __init__(self, enabled=True, color=False):
+    """Event-driven stderr display; no background threads or additional API calls."""
+
+    def __init__(self, enabled=True, color=False, output_format="text", stream=None, clock=None):
         self.enabled = enabled
-        self.color = color
-        self.started_at = time.monotonic()
-        self.last_tty_length = 0
+        self.stream = sys.stderr if stream is None else stream
+        self.clock = time.monotonic if clock is None else clock
+        self.color = color and output_format != "json"
+        try:
+            tty = self.stream.isatty()
+        except Exception:
+            tty = False
+        self.live = bool(tty and self.color and "NO_COLOR" not in os.environ
+                         and os.environ.get("TERM", "").lower() != "dumb")
+        self.interval = 0.2 if self.live else 5.0
+        self.started_at = self.clock()
+        self.task_started_at = self.started_at
+        self.last_render_at = float("-inf")
+        self.rendered_rows = 0
+        self.rendered_width = None
+        self.pending = None
+        self.last_lines = None
+        self.task_label = ""
+        self.library_progress = None
 
     def _elapsed(self):
-        return time.monotonic() - self.started_at
+        return self.clock() - self.started_at
+
+    def _width(self):
+        try:
+            columns = os.get_terminal_size(self.stream.fileno()).columns
+        except (AttributeError, OSError, ValueError):
+            columns = shutil.get_terminal_size(fallback=(100, 24)).columns
+        return max(1, min(140, columns) - 1)
 
     def line(self, message, transient=False, style=None):
         if not self.enabled:
             return
-        plain_text = "{0}  ({1:.1f}s)".format(message, self._elapsed())
-        if transient and sys.stderr.isatty():
-            width = terminal_width()
-            plain_text = truncate_display(plain_text, width - 1)
-            padding = " " * max(0, self.last_tty_length - display_width(plain_text))
-            rendered = style_text(plain_text, style, self.color)
-            print("\r{0}{1}".format(rendered, padding), end="", file=sys.stderr, flush=True)
-            self.last_tty_length = display_width(plain_text)
-        else:
-            self.finish_transient()
-            print(style_text(plain_text, style, self.color), file=sys.stderr, flush=True)
+        if transient:
+            self.render([message])
+            return
+        self.finish_transient()
+        print(style_text(progress_text(message), style, self.color), file=self.stream, flush=True)
 
     def phase(self, current, total, message):
         self.line("[{0}/{1}] {2}".format(current, total, message), style=STYLE_BOLD_CYAN)
 
-    def update(self, current, total, message):
-        self.line(
-            "{0}: {1:,}/{2:,}".format(message, current, total),
-            transient=True,
-            style=STYLE_CYAN,
-        )
-
-    def count(self, current, message):
-        self.line("{0}: {1:,}".format(message, current), transient=True, style=STYLE_CYAN)
-
     def detail(self, message):
         self.line("      {0}".format(message), style=STYLE_DIM)
 
+    def start_task(self, label):
+        self.finish_transient()
+        self.task_label = label
+        self.task_started_at = self.clock()
+        self.last_render_at = float("-inf")
+        self.last_lines = None
+
+    def set_context(self, label):
+        """Change the active work without ending the panel or resetting its clock."""
+        self.task_label = label
+
+    def set_library_progress(self, current, total, processed, skipped=0):
+        self.library_progress = (current, total, processed, skipped)
+
+    def render(self, lines, force=False):
+        if not self.enabled:
+            return
+        self.pending = [progress_text(line) for line in lines]
+        now = self.clock()
+        if not force and now - self.last_render_at < self.interval:
+            return
+        lines = self.pending
+        self.pending = None
+        if lines == self.last_lines:
+            return
+        width = self._width()
+        if self.live:
+            # A resized terminal may have reflowed old rows. Leave them in place
+            # rather than moving the cursor into unrelated output.
+            if self.rendered_rows and self.rendered_width != width:
+                print(file=self.stream)
+                self.rendered_rows = 0
+            if self.rendered_rows:
+                self.stream.write("\r")
+                if self.rendered_rows > 1:
+                    self.stream.write("\033[{0}A".format(self.rendered_rows - 1))
+            rows = max(self.rendered_rows, len(lines))
+            for index in range(rows):
+                self.stream.write("\r\033[2K")
+                if index < len(lines):
+                    text = truncate_display(lines[index], width)
+                    self.stream.write(style_text(text, STYLE_CYAN if index == 0 else None, self.color))
+                if index < rows - 1:
+                    self.stream.write("\n")
+            self.rendered_rows = rows
+            self.rendered_width = width
+        else:
+            print(" | ".join(lines), file=self.stream)
+        self.stream.flush()
+        self.last_lines = lines
+        self.last_render_at = now
+
     def finish_transient(self):
-        if self.enabled and self.last_tty_length and sys.stderr.isatty():
-            print(file=sys.stderr, flush=True)
-        self.last_tty_length = 0
+        if self.pending is not None:
+            self.render(self.pending, force=True)
+        if self.rendered_rows:
+            print(file=self.stream, flush=True)
+        self.rendered_rows = 0
+        self.last_lines = None
+
+    def _meter(self, current, total, unit, prefix_width=0, bar_width=24):
+        if total is None or total <= 0 or current > total:
+            return "{0:,} {1}".format(current, unit)
+        ratio = max(0, min(1, current / total))
+        counts = "{0}% · {1:,}/{2:,} {3}".format(int(ratio * 100), current, total, unit)
+        bar_width = min(bar_width, self._width() - prefix_width - display_width(counts) - 3)
+        if bar_width < 8:
+            return counts
+        filled = int(ratio * bar_width)
+        return "[{0}{1}] {2}".format("=" * filled, "-" * (bar_width - filled), counts)
+
+    def _timing(self, current, total=None, eta=False):
+        elapsed = max(0, self.clock() - self.task_started_at)
+        text = "Elapsed " + duration_text(elapsed)
+        if self._width() >= 64 and elapsed >= 1 and current:
+            rate = current / elapsed
+            text += " · {0:,.1f}/s".format(rate)
+            if eta and elapsed >= 3 and total is not None and current < total:
+                text += " · ETA ~" + duration_text((total - current) / rate)
+        return text
+
+    def scan(self, stats, current, total=None, force=False):
+        if not self.enabled:
+            return
+        lines = ["Scanning metadata"]
+        context = "Library   " + self.task_label
+        library_line = None
+        bar_width = 24
+        if self.library_progress is not None:
+            index, library_total, processed, skipped = self.library_progress
+            suffix = " · Skipped {0:,}".format(skipped) if skipped else ""
+            # Reserve the same bar width for both rows, including long counts
+            # and skip annotations, so the adjacent meters stay aligned.
+            library_counts = self._meter(processed, library_total, "processed", bar_width=0)
+            query_counts = self._meter(current, total, "items", bar_width=0)
+            bar_width = max(0, min(24, self._width() - 13 - max(
+                display_width(library_counts + suffix), display_width(query_counts))))
+            meter = (self._meter(processed, library_total, "processed", 10, bar_width)
+                     if library_total else "0 selected")
+            library_line = "Libraries " + meter + suffix
+            context = ("Library   {0}/{1} · {2}".format(index, library_total, self.task_label)
+                       if index else "Current   " + self.task_label)
+        lines.append(context)
+        if library_line is not None:
+            lines.append(library_line)
+        lines.append("Query     " + self._meter(current, total, "items", 10, bar_width))
+        if self._width() < 64:
+            lines += ["Scanned {0:,}".format(stats["total_api_rows"]),
+                      "Candidates {0:,}".format(stats["candidates"])]
+        else:
+            lines.append("Total scanned {0:,} · Candidates {1:,}".format(
+                stats["total_api_rows"], stats["candidates"]))
+        lines.append(self._timing(stats["total_api_rows"]))
+        self.render(lines, force=force)
+
+    def backup(self, current, total, stage="Copying pages", force=False):
+        if not self.enabled:
+            return
+        self.render(["Backup    " + self.task_label,
+                     stage + " · " + self._meter(current, total, "pages", display_width(stage) + 3),
+                     self._timing(0)], force=force)
+
+    def applying(self, stats, total, stage, force=False):
+        if not self.enabled:
+            return
+        # Completed includes failures; it never means successful PUTs alone.
+        completed = stats["verified"] + stats["failed"]
+        lines = [stage, "Processed " + self._meter(completed, total, "items", prefix_width=10)]
+        if self._width() < 64:
+            lines += ["Verified {0:,} · Failed {1:,}".format(stats["verified"], stats["failed"]),
+                      "Skipped {0:,} · PUT OK {1:,}".format(stats["skipped_before_put"], stats["put_succeeded"])]
+        else:
+            lines.append("Verified {0:,} · Failed {1:,} · Skipped {2:,} · PUT OK {3:,}".format(
+                stats["verified"], stats["failed"], stats["skipped_before_put"], stats["put_succeeded"]))
+        lines.append(self._timing(completed, total, eta=True))
+        self.render(lines, force=force)
 
 
 def emit_json(payload):
@@ -602,6 +758,9 @@ def emit_json(payload):
 
 
 def emit_error(args, exit_code, message):
+    progress = getattr(args, "progress", None)
+    if progress:
+        progress.finish_transient()
     stderr_color = getattr(args, "stderr_color", False)
     stdout_color = getattr(args, "stdout_color", False)
     print(style_text("ERROR: {0}".format(message), STYLE_BOLD_RED, stderr_color), file=sys.stderr)
@@ -946,7 +1105,7 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def online_backup_database(source, destination):
+def online_backup_database(source, destination, progress=None):
     partial = destination.with_name(destination.name + ".partial")
     if destination.exists() or partial.exists():
         raise RuntimeError("backup destination already exists: {0}".format(destination))
@@ -954,7 +1113,12 @@ def online_backup_database(source, destination):
     destination_connection = sqlite3.connect(str(partial), timeout=60.0)
     try:
         source_connection.execute("PRAGMA query_only = ON")
-        source_connection.backup(destination_connection, pages=1024, sleep=0.05)
+        def report_pages(status, remaining, total):
+            if progress:
+                progress.backup(total - remaining, total, force=remaining == 0)
+
+        source_connection.backup(destination_connection, pages=1024, sleep=0.05,
+                                 progress=report_pages if progress else None)
     finally:
         destination_connection.close()
         source_connection.close()
@@ -966,6 +1130,8 @@ def online_backup_database(source, destination):
         check.close()
     if page_count <= 0 or destination.stat().st_size <= 0:
         raise RuntimeError("backup verification failed: {0}".format(destination))
+    if progress:
+        progress.backup(page_count, page_count, stage="Checking SHA-256", force=True)
     source_stat = source.stat()
     return {
         "name": destination.name,
@@ -1026,18 +1192,23 @@ def create_backup_bundle(args, db_dir, identity, progress=None):
         "files": [],
     }
     try:
-        for source in sources:
+        for index, source in enumerate(sources, 1):
             if progress:
-                progress.detail("Backing up {0}".format(source.name))
+                progress.start_task("{0}/2 · {1}".format(index, source.name))
+                progress.backup(0, None)
             else:
                 print("Backing up: {0}".format(source))
-            manifest["files"].append(online_backup_database(source, bundle / source.name))
+            manifest["files"].append(online_backup_database(source, bundle / source.name, progress))
+            if progress:
+                progress.detail("File {0}/2 verified".format(index))
         manifest_path = bundle / BACKUP_MANIFEST_NAME
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=True, indent=2) + "\n",
             encoding="utf-8",
         )
     except Exception:
+        if progress:
+            progress.finish_transient()
         print("Incomplete backup bundle retained for inspection: {0}".format(bundle), file=sys.stderr)
         raise
     return bundle, manifest
@@ -1590,7 +1761,7 @@ def section_type_plan(client, section, requested_type=None):
     return all_types, set(optional)
 
 
-def iter_paged_elements(client, path, params, page_size):
+def iter_paged_elements(client, path, params, page_size, page_info=None):
     start = 0
     while True:
         headers = {
@@ -1598,17 +1769,21 @@ def iter_paged_elements(client, path, params, page_size):
             "X-Plex-Container-Size": str(page_size),
         }
         root, response_headers = client.get(path, params=params, extra_headers=headers)
+        response_headers = {key.lower(): value for key, value in response_headers.items()}
         elements = list(direct_metadata_elements(root))
         body_size = int_or_none(root.attrib.get("size"))
         page_count = body_size if body_size is not None else len(elements)
         total = int_or_none(root.attrib.get("totalSize"))
         if total is None:
-            total = int_or_none(response_headers.get("X-Plex-Container-Total-Size"))
+            total = int_or_none(response_headers.get("x-plex-container-total-size"))
         offset = int_or_none(root.attrib.get("offset"))
         if offset is None:
-            offset = int_or_none(response_headers.get("X-Plex-Container-Start"))
+            offset = int_or_none(response_headers.get("x-plex-container-start"))
         if offset is None:
             offset = start
+
+        if page_info is not None:
+            page_info.update(offset=offset, count=page_count, total=total)
 
         yield elements
 
@@ -1831,13 +2006,24 @@ def scan_api(client, args, sections, spool_path, article_strings, progress=None)
     by_type = defaultdict(Counter)
     warnings = []
     seen = set()
+    selected_sections = [section for section in sections
+                         if args.metadata_type != 15
+                         and (args.section is None or section["id"] == args.section)]
+    library_total = len(selected_sections)
+    libraries_skipped = 0
 
+    if progress:
+        progress.start_task("Preparing scan")
+        progress.set_library_progress(0, library_total, 0)
+        progress.scan(stats, 0)
     with spool_path.open("w", encoding="utf-8", newline="\n") as spool:
-        for section in sections:
-            if args.metadata_type == 15:
-                continue
-            if args.section is not None and section["id"] != args.section:
-                continue
+        for library_index, section in enumerate(selected_sections, 1):
+            if progress:
+                progress.set_library_progress(library_index, library_total,
+                                              library_index - 1, libraries_skipped)
+                progress.set_context("{0} · Discovering types (section {1})".format(
+                    section["title"], section["id"]))
+                progress.scan(stats, 0)
             types, optional_types = section_type_plan(client, section, args.metadata_type)
             if not types:
                 warnings.append(
@@ -1845,20 +2031,27 @@ def scan_api(client, args, sections, spool_path, article_strings, progress=None)
                         section["id"], section["title"]
                     )
                 )
-                continue
-            for type_id in types:
+                libraries_skipped += 1
                 if progress:
-                    progress.detail(
-                        "Section {0} / {1} / type {2} ({3})".format(
-                            section["id"], section["title"], type_id, TYPE_NAMES.get(type_id, "Unknown")
-                        )
-                    )
+                    progress.set_library_progress(library_index, library_total,
+                                                  library_index, libraries_skipped)
+                    progress.set_context("{0} · Skipped (unknown types)".format(section["title"]))
+                    progress.scan(stats, 0)
+                continue
+            queries_completed = 0
+            for type_id in types:
+                page_info = {}
+                if progress:
+                    progress.set_context("{0} · {1} (section {2})".format(
+                        section["title"], TYPE_NAMES.get(type_id, "Unknown"), section["id"]))
+                    progress.scan(stats, 0)
                 try:
                     pages = iter_paged_elements(
                         client,
                         "/library/sections/{0}/all".format(section["id"]),
                         {"type": type_id, "includeExternalMedia": 1},
                         args.page_size,
+                        page_info=page_info,
                     )
                     for elements in pages:
                         selected = []
@@ -1886,8 +2079,12 @@ def scan_api(client, args, sections, spool_path, article_strings, progress=None)
                                     continue
                                 update_stats_for_candidate(stats, candidate, by_library, by_type)
                                 write_spool(spool, candidate)
+                            if progress:
+                                progress.scan(stats, page_info["offset"], page_info["total"])
                         if progress:
-                            progress.count(stats["total_api_rows"], "Scanning metadata")
+                            progress.scan(stats, page_info["offset"] + page_info["count"],
+                                          page_info["total"])
+                    queries_completed += 1
                 except PlexApiError as exc:
                     if type_id in optional_types and exc.status in (400, 404):
                         warnings.append(
@@ -1896,16 +2093,30 @@ def scan_api(client, args, sections, spool_path, article_strings, progress=None)
                             )
                         )
                         continue
+                    if progress:
+                        progress.finish_transient()
                     raise
+            if not queries_completed:
+                libraries_skipped += 1
+            if progress:
+                progress.set_library_progress(library_index, library_total,
+                                              library_index, libraries_skipped)
+                progress.set_context("{0} · {1}".format(
+                    section["title"], "Finished" if queries_completed else "Skipped (unsupported types)"))
+                progress.scan(stats, 0)
 
         include_playlists = not args.no_playlists and args.section is None
         if args.metadata_type is not None and args.metadata_type != 15:
             include_playlists = False
         if include_playlists:
+            page_info = {}
             if progress:
-                progress.detail("Playlists / type 15")
+                progress.set_library_progress(0, library_total, library_total, libraries_skipped)
+                progress.set_context("Playlists · Playlist")
+                progress.scan(stats, 0)
             try:
-                for elements in iter_paged_elements(client, "/playlists", {"type": 15}, args.page_size):
+                for elements in iter_paged_elements(client, "/playlists", {"type": 15}, args.page_size,
+                                                     page_info=page_info):
                     for element in elements:
                         item = item_from_element(element, queried_type=15, api_kind="playlist")
                         if item is None:
@@ -1928,12 +2139,16 @@ def scan_api(client, args, sections, spool_path, article_strings, progress=None)
                             continue
                         update_stats_for_candidate(stats, candidate, by_library, by_type)
                         write_spool(spool, candidate)
+                        if progress:
+                            progress.scan(stats, page_info["offset"], page_info["total"])
                     if progress:
-                        progress.count(stats["total_api_rows"], "Scanning metadata")
+                        progress.scan(stats, page_info["offset"] + page_info["count"], page_info["total"])
             except PlexApiError as exc:
                 if exc.status in (400, 404):
                     warnings.append("Playlist endpoint is not supported; skipped Playlist items")
                 else:
+                    if progress:
+                        progress.finish_transient()
                     raise
 
     if progress:
@@ -2086,10 +2301,15 @@ def verify_element(item, element):
     return True, "", "", diagnostics
 
 
-def apply_batch(client, batch, writer, apply_stats, run_logger):
+def apply_batch(client, batch, writer, apply_stats, run_logger, on_progress=None):
+    def notify(stage):
+        if on_progress:
+            on_progress(stage)
+
     library_successes = []
     playlist_successes = []
     for item in batch:
+        notify("Checking current metadata")
         try:
             preflight_element = fetch_candidate_detail(client, item)
         except Exception as exc:
@@ -2107,6 +2327,7 @@ def apply_batch(client, batch, writer, apply_stats, run_logger):
                     "expected_locked": bool(item.get("title_sort_locked")),
                 },
             )
+            notify("Pre-apply check failed")
             if writer:
                 writer.writerow(csv_row(item))
             continue
@@ -2128,19 +2349,14 @@ def apply_batch(client, batch, writer, apply_stats, run_logger):
                 diagnostics=diagnostics,
                 element=preflight_element,
             )
+            notify("Skipped changed metadata")
             if writer:
                 writer.writerow(csv_row(item))
             continue
 
+        notify("Sending update")
         try:
             apply_candidate(client, item)
-            item["result"] = "APPLIED_PENDING_VERIFY"
-            if item["api_kind"] == "playlist":
-                playlist_successes.append(item)
-            else:
-                library_successes.append(item)
-            apply_stats["put_succeeded"] += 1
-            run_logger.put_succeeded(item)
         except Exception as exc:
             item["result"] = "APPLY_FAILED"
             item["error"] = str(exc)
@@ -2152,10 +2368,21 @@ def apply_batch(client, batch, writer, apply_stats, run_logger):
                 "APPLY_REQUEST_ERROR",
                 str(exc),
             )
+            notify("Update request failed")
             if writer:
                 writer.writerow(csv_row(item))
+        else:
+            item["result"] = "APPLIED_PENDING_VERIFY"
+            if item["api_kind"] == "playlist":
+                playlist_successes.append(item)
+            else:
+                library_successes.append(item)
+            apply_stats["put_succeeded"] += 1
+            run_logger.put_succeeded(item)
+            notify("Update sent · Awaiting verification")
 
     if library_successes:
+        notify("Verifying library updates")
         try:
             details = fetch_library_details(client, library_successes)
         except Exception as exc:
@@ -2181,6 +2408,7 @@ def apply_batch(client, batch, writer, apply_stats, run_logger):
                         "VERIFY_FETCH_ERROR",
                         item["error"],
                     )
+                    notify("Verification fetch failed")
                     if writer:
                         writer.writerow(csv_row(item))
                     continue
@@ -2204,10 +2432,12 @@ def apply_batch(client, batch, writer, apply_stats, run_logger):
                     diagnostics=diagnostics,
                     element=element,
                 )
+            notify("Verifying library updates")
             if writer:
                 writer.writerow(csv_row(item))
 
     for item in playlist_successes:
+        notify("Verifying playlist update")
         try:
             element = fetch_playlist_detail(client, item["metadata_id"])
             ok, error_code, error, diagnostics = verify_element(item, element)
@@ -2236,6 +2466,7 @@ def apply_batch(client, batch, writer, apply_stats, run_logger):
                 diagnostics=diagnostics,
                 element=element,
             )
+        notify("Verifying playlist update")
         if writer:
             writer.writerow(csv_row(item))
 
@@ -2260,16 +2491,24 @@ def output_dry_run(spool_path, writer):
             writer.writerow(csv_row(item))
 
 
-def apply_spool(client, spool_path, writer, batch_size, run_logger, total=0, progress=None):
-    apply_stats = Counter()
-    processed = 0
-    for batch in chunks(read_spool(spool_path), batch_size):
-        apply_batch(client, batch, writer, apply_stats, run_logger)
-        processed += len(batch)
+def apply_spool(client, spool_path, writer, batch_size, run_logger, total=0, progress=None,
+                apply_stats=None):
+    if apply_stats is None:
+        apply_stats = Counter()
+
+    def notify(stage):
         if progress:
-            progress.update(processed, total, "Applying and verifying")
+            progress.applying(apply_stats, total, stage)
+
     if progress:
-        progress.finish_transient()
+        progress.start_task("Applying and verifying")
+        notify("Applying and verifying")
+    try:
+        for batch in chunks(read_spool(spool_path), batch_size):
+            apply_batch(client, batch, writer, apply_stats, run_logger, on_progress=notify)
+    finally:
+        if progress:
+            progress.finish_transient()
     return apply_stats
 
 
@@ -2449,7 +2688,9 @@ def print_summary(
         print("Token  : {0}".format(token_source))
         print("Articles: {0}".format(", ".join(article_strings) if article_strings else "(none)"))
         print("Article source: {0}".format(article_source))
-    print_section("Scan summary", color)
+    scan_duration = getattr(args, "scan_duration", None)
+    print_section("Scan complete" + (
+        " · " + duration_text(scan_duration) if scan_duration is not None else ""), color)
     print("  Metadata rows                     {0:>10,}".format(stats["total_api_rows"]))
     print("  Title missing                     {0:>10,}".format(stats["title_null"]))
     print("  Title empty                       {0:>10,}".format(stats["title_empty"]))
@@ -2459,6 +2700,7 @@ def print_summary(
     print("    Plex title fallback             {0:>10,}".format(stats["already_correct_title_fallback"]))
     if stats["already_correct_other"]:
         print("    Other equivalent state          {0:>10,}".format(stats["already_correct_other"]))
+    print("  Candidates                        {0:>10,}".format(stats["candidates"]))
 
     print_section("Planned changes", color)
     if not stats["candidates"]:
@@ -2625,10 +2867,12 @@ def apply_result_name(candidate_count, apply_stats):
     return "APPLY FAILED"
 
 
-def print_dry_run_result(stats, csv_path, color=False):
+def print_dry_run_result(stats, csv_path, color=False, elapsed=None):
     result = dry_run_result_name(stats["candidates"])
     print("\n{0}".format(result_line(result, color)))
     print("HTTP PUT requests: 0")
+    if elapsed is not None:
+        print("Elapsed: {0}".format(duration_text(elapsed)))
     if stats["candidates"]:
         print("Next step: review the preview or CSV, then rerun with --apply.")
     if csv_path:
@@ -2637,10 +2881,20 @@ def print_dry_run_result(stats, csv_path, color=False):
     print("Exit code: 0")
 
 
-def print_apply_result(stats, apply_stats, run_logger, backup_bundle, csv_path, color=False):
+def print_apply_result(stats, apply_stats, run_logger, backup_bundle, csv_path, color=False,
+                       elapsed=None):
     result = apply_result_name(stats["candidates"], apply_stats)
     exit_code = 4 if apply_stats["failed"] else 0
     print("\n{0}".format(result_line(result, color)))
+    print("Verified {0:,} · Failed {1:,} · Skipped before PUT {2:,}".format(
+        apply_stats["verified"], apply_stats["failed"], apply_stats["skipped_before_put"]))
+    if elapsed is not None:
+        print("Elapsed: {0}".format(duration_text(elapsed)))
+    print_section("Artifacts", color)
+    print("  Backup  : {0}".format(backup_bundle or "(not created)"))
+    print("  Logs    : {0}".format(run_logger.run_dir))
+    if csv_path:
+        print("  CSV     : {0}".format(csv_path.expanduser().resolve()))
     print_section("Apply summary", color)
     print("  Planned                         {0:>10,}".format(stats["candidates"]))
     print("  PUT succeeded                   {0:>10,}".format(apply_stats["put_succeeded"]))
@@ -2661,19 +2915,6 @@ def print_apply_result(stats, apply_stats, run_logger, backup_bundle, csv_path, 
             print("  {0}".format(truncate_display(heading, terminal_width() - 2)))
             detail = "{0}: {1}".format(sample.get("error_code"), sample.get("error"))
             print("    {0}".format(truncate_display(detail, terminal_width() - 4)))
-    print_section("Artifacts", color)
-    if backup_bundle:
-        print("  Backup  : {0}".format(backup_bundle))
-    else:
-        print("  Backup  : (not created)")
-    print("  Logs    : {0}".format(run_logger.run_dir))
-    print("    run.log")
-    print("    failures.csv")
-    print("    summary.json")
-    if apply_stats["failed"]:
-        print("    responses/")
-    if csv_path:
-        print("  CSV     : {0}".format(csv_path.expanduser().resolve()))
     if apply_stats["failed"]:
         print("\nNext step: inspect failures.csv and the saved API responses before retrying.")
     elif stats["candidates"]:
@@ -2699,7 +2940,12 @@ def main(argv=None):
     progress = ProgressReporter(
         enabled=not args.quiet_progress,
         color=args.stderr_color,
+        output_format=args.output_format,
     )
+    args.progress = progress
+    progress.line("Plex NFKD Sort Title {0} · {1} · {2}".format(
+        VERSION, "RESTORE" if args.restore_backup else ("APPLY" if args.apply else "DRY-RUN"),
+        "Database recovery" if args.restore_backup else scope_label(args)), style=STYLE_BOLD_CYAN)
     preferences_path, preferences_attrs, preferences_errors = load_preferences(args.preferences)
 
     if args.restore_backup:
@@ -2796,6 +3042,7 @@ def main(argv=None):
     writer = None
     try:
         progress.phase(2, phase_total, "Scanning metadata")
+        scan_started_at = time.monotonic()
         try:
             stats, by_library, by_type, warnings = scan_api(
                 client, args, sections, spool_path, article_strings, progress
@@ -2804,11 +3051,9 @@ def main(argv=None):
             return emit_error(
                 args, 3, "API scan failed; no changes were started: {0}".format(exc)
             )
-        progress.detail(
-            "Scan complete: {0:,} rows, {1:,} candidates".format(
-                stats["total_api_rows"], stats["candidates"]
-            )
-        )
+        args.scan_duration = time.monotonic() - scan_started_at
+        progress.detail("Scan complete · {0} · {1:,} rows · {2:,} candidates".format(
+            duration_text(args.scan_duration), stats["total_api_rows"], stats["candidates"]))
 
         report = build_scan_report(
             args,
@@ -2912,6 +3157,7 @@ def main(argv=None):
                 )
 
             progress.phase(4, phase_total, "Applying and verifying changes")
+            apply_stats = Counter()
             try:
                 apply_stats = apply_spool(
                     client,
@@ -2921,17 +3167,27 @@ def main(argv=None):
                     run_logger,
                     stats["candidates"],
                     progress,
+                    apply_stats=apply_stats,
                 )
             except Exception as exc:
-                run_logger.event("ERROR", "RUN_ABORTED", "Unexpected apply error: {0}".format(exc))
-                apply_stats = Counter({"failed": 1, "failure:UNEXPECTED_RUN_ERROR": 1})
+                apply_stats["run_errors"] += 1
+                apply_stats["failure:UNEXPECTED_RUN_ERROR"] += 1
                 run_logger.failure_counts["UNEXPECTED_RUN_ERROR"] += 1
-                run_logger.finish(apply_stats)
+                diagnostic_error = ""
+                try:
+                    run_logger.event("ERROR", "RUN_ABORTED", "Unexpected apply error: {0}".format(exc))
+                    run_logger.finish(apply_stats)
+                except OSError as log_error:
+                    diagnostic_error = " Diagnostic output also failed: {0}.".format(log_error)
                 print(
                     style_text("Apply logs: {0}".format(run_dir), STYLE_YELLOW, args.stderr_color),
                     file=sys.stderr,
                 )
-                return emit_error(args, 5, "apply stopped unexpectedly: {0}".format(exc))
+                return emit_error(args, 5, (
+                    "apply stopped unexpectedly: {0}; PUT succeeded={1}, verified={2}, "
+                    "failed={3}, skipped before PUT={4}. Inspect the apply logs before retrying.{5}"
+                ).format(exc, apply_stats["put_succeeded"], apply_stats["verified"],
+                         apply_stats["failed"], apply_stats["skipped_before_put"], diagnostic_error))
             run_logger.finish(apply_stats)
             if csv_handle:
                 csv_handle.flush()
@@ -2970,6 +3226,7 @@ def main(argv=None):
                     backup_bundle,
                     args.csv,
                     args.stdout_color,
+                    elapsed=progress._elapsed(),
                 )
             return exit_code
 
@@ -2985,9 +3242,10 @@ def main(argv=None):
         if args.output_format == "json":
             emit_json(report)
         else:
-            print_dry_run_result(stats, args.csv, args.stdout_color)
+            print_dry_run_result(stats, args.csv, args.stdout_color, elapsed=progress._elapsed())
         return 0
     finally:
+        progress.finish_transient()
         if csv_handle:
             csv_handle.close()
         remove_temp(spool_path)
